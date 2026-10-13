@@ -35,6 +35,8 @@ SEVERITY_LABELS: Dict[int, str] = {
     3: "Threatening Content",
 }
 
+SEVERITY_REASONS = SEVERITY_LABELS
+
 VALID_SEVERITY_SCORES = frozenset(SEVERITY_LABELS.keys())
 
 PROFANITY_API_URL_ENV = "PROFANITY_API_URL"
@@ -64,6 +66,9 @@ TEXT_FIELDS = (
 
 class ProfanityApiError(RuntimeError):
     """Raised when the Profanity API cannot be reached or returns an unusable response."""
+
+
+ProfanityAPIError = ProfanityApiError
 
 
 class InvalidSeverityScoreError(ValueError):
@@ -130,19 +135,24 @@ def extract_help_request_text(payload: dict[str, Any]) -> str:
 
 
 def call_profanity_api(
-    text: str,
-    subject: Optional[str] = None,
+    subject_or_text: str,
     description: Optional[str] = None,
+    *,
+    subject: Optional[str] = None,
     api_url: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Call the external Profanity API with the Help Request content.
 
+    Supports both signatures:
+    - call_profanity_api(subject, description)
+    - call_profanity_api(text)
+
     Args:
-        text: Text to evaluate.
-        subject: Optional request subject/title.
+        subject_or_text: Request subject or full combined text to evaluate.
         description: Optional request description.
+        subject: Optional explicit subject override.
         api_url: Optional override for the Profanity API URL.
         api_key: Optional override for the API authentication key.
         timeout: Request timeout in seconds.
@@ -151,11 +161,26 @@ def call_profanity_api(
         Decoded JSON response dictionary from the API.
 
     Raises:
-        ValueError: If text is empty or not a string.
+        ValueError: If text or subject is empty or not a string.
         ProfanityApiError: If URL is missing, request fails, or response is invalid JSON.
     """
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("Text to classify must be a non-empty string")
+    if not isinstance(subject_or_text, str) or not subject_or_text.strip():
+        raise ValueError("Text/subject to classify must be a non-empty string")
+
+    if subject is not None:
+        eff_subject = subject.strip() if subject else None
+        eff_desc = description.strip() if description else None
+        text = subject_or_text.strip()
+    elif description is not None:
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError("description must be a non-empty string")
+        eff_subject = subject_or_text.strip()
+        eff_desc = description.strip()
+        text = f"{eff_subject} {eff_desc}".strip()
+    else:
+        text = subject_or_text.strip()
+        eff_subject = None
+        eff_desc = None
 
     resolved_url = (api_url or os.environ.get(PROFANITY_API_URL_ENV, "")).strip()
     if not resolved_url:
@@ -170,13 +195,13 @@ def call_profanity_api(
         headers["Authorization"] = f"Bearer {resolved_key}"
 
     body: dict[str, Any] = {
-        "text": text.strip(),
-        "content": text.strip(),
+        "text": text,
+        "content": text,
     }
-    if subject:
-        body["subject"] = str(subject).strip()
-    if description:
-        body["description"] = str(description).strip()
+    if eff_subject:
+        body["subject"] = eff_subject
+    if eff_desc:
+        body["description"] = eff_desc
 
     try:
         response = requests.post(

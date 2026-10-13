@@ -132,6 +132,27 @@ class TestCallProfanityApi(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], DEFAULT_TIMEOUT_SECONDS)
 
     @patch("requests.post")
+    def test_positional_subject_and_description_call(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"severity_score": 1}
+        mock_post.return_value = mock_response
+
+        with patch.dict(os.environ, {PROFANITY_API_URL_ENV: "https://api.example.com/check"}):
+            result = call_profanity_api("Subject text", "Description text")
+
+        self.assertEqual(result, {"severity_score": 1})
+        mock_post.assert_called_once()
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["json"]["text"], "Subject text Description text")
+        self.assertEqual(kwargs["json"]["subject"], "Subject text")
+        self.assertEqual(kwargs["json"]["description"], "Description text")
+
+    def test_aliases_present(self):
+        from src.profanity import ProfanityAPIError, SEVERITY_LABELS, SEVERITY_REASONS
+        self.assertIs(ProfanityAPIError, ProfanityApiError)
+        self.assertIs(SEVERITY_REASONS, SEVERITY_LABELS)
+
+    @patch("requests.post")
     def test_api_call_with_api_key(self, mock_post):
         mock_response = MagicMock()
         mock_response.json.return_value = {"score": 1}
