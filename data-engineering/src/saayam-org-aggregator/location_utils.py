@@ -127,9 +127,9 @@ def get_beneficiary_profile_address(cursor, schema, beneficiary_id):
             u.zip_code,
             c.country_name
         FROM {schema}.users AS u
-        LEFT JOIN {schema}.state AS s
+        LEFT JOIN {schema}.states AS s
             ON u.state_id = s.state_id
-        LEFT JOIN {schema}.country AS c
+        LEFT JOIN {schema}.countries AS c
             ON u.country_id = c.country_id
         WHERE u.user_id = %s
         LIMIT 1
@@ -169,7 +169,7 @@ def get_request_details(cursor, schema, request_id):
             req_user_id,
             req_for_id,
             req_loc
-        FROM {schema}.request
+        FROM {schema}.requests
         WHERE req_id = %s
         LIMIT 1
     """

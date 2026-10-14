@@ -131,3 +131,28 @@ def test_build_organization_address_ignores_nan():
 
     assert result == "Jersey City, 07306"
     assert "nan" not in result.lower()
+
+def test_genai_organization_location_fallback():
+
+    organization = {
+        "organization_name": "Example Organization",
+        "location": "Mountain View, CA 94043",
+    }
+
+    address = geocoding_utils.build_organization_address(organization)
+
+    assert address == "Mountain View, CA 94043"
+
+def test_genai_location_fallback_when_city_is_nan():
+    organization = {
+        "name": "AI Organization",
+        "city_name": float("nan"),
+        "location": "Mountain View",
+        "state_code": "CA",
+    }
+
+    result = geocoding_utils.build_organization_address(
+        organization
+    )
+
+    assert result == "Mountain View, CA"

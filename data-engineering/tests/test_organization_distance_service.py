@@ -87,3 +87,26 @@ def test_multiple_organizations():
     assert len(results) == 2
     assert all(result["distance"] is not None for result in results)
     assert all(result["distance_status"] == "ok" for result in results)
+
+def test_sort_organizations_by_distance():
+    organizations = [
+        {"name": "Unknown", "distance": None},
+        {"name": "Far", "distance": 25.5},
+        {"name": "Same Location", "distance": 0},
+        {"name": "Near", "distance": 4.8},
+    ]
+
+    result = service.sort_organizations_by_distance(
+    organizations
+)
+    
+
+    assert [org["name"] for org in result] == [
+        "Same Location",
+        "Near",
+        "Far",
+        "Unknown",
+    ]
+
+    # Original list must remain unchanged.
+    assert organizations[0]["name"] == "Unknown"
