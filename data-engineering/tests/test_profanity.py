@@ -353,6 +353,32 @@ class TestGetRoutingDecision(unittest.TestCase):
 class TestEvaluateHelpRequest(unittest.TestCase):
     """Unit tests for evaluate_help_request."""
 
+    @patch.dict(os.environ, {
+        PROFANITY_API_URL_ENV: "https://classifier.example/test",
+    })
+    @patch("src.profanity.requests.post")
+    def test_default_client_calls_http_api(self, mock_post):
+        """Exercise evaluation and the real API client, mocking only HTTP."""
+        mock_post.return_value.json.return_value = {"score": 0}
+
+        result = evaluate_help_request({
+            "subject": "Need groceries",
+            "description": "Need food items",
+        })
+
+        self.assertEqual(result["severity_score"], 0)
+        self.assertTrue(result["allow_active_matching"])
+        mock_post.assert_called_once()
+        self.assertEqual(
+            mock_post.call_args.args[0], "https://classifier.example/test",
+        )
+        self.assertEqual(mock_post.call_args.kwargs["json"], {
+            "text": "Need groceries Need food items",
+            "content": "Need groceries Need food items",
+            "subject": "Need groceries",
+            "description": "Need food items",
+        })
+
     def test_evaluation_clean_request(self):
         mock_client = Mock(return_value={"score": 0})
         payload = {"subject": "Need groceries", "description": "Need food items"}

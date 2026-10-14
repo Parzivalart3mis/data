@@ -395,7 +395,7 @@ def evaluate_help_request(
         api_response = api_client(text)
     else:
         api_response = call_profanity_api(
-            text=text,
+            subject_or_text=text,
             subject=str(subject) if subject else None,
             description=str(description) if description else None,
         )
