@@ -1,8 +1,8 @@
 """Size & Contribution analytics for the Organization dashboard (#376).
 
-Returns two charts: organizations_by_size and collaborator_vs_contributor.
-With no custom dates the response has 7D/30D/1Y/All plus an empty Custom.
-If size_* or contribution_* dates are sent, only Custom is returned.
+Returns organizations_by_size and collaborator_vs_contributor.
+Default keys are 7D/30D/1Y/All; Custom dates return only Custom.
+Each chart uses its own date pair and is empty when that pair is absent.
 
 Set USE_MOCK_DATA=true and MOCK_DATA_DIR to run against local CSVs,
 otherwise it reads from Postgres using the DB_* env vars.
@@ -188,7 +188,6 @@ def build_body(count, size_pair, contribution_pair, today):
                 SIZE_CHART: size_chart(sizes),
                 CONTRIBUTION_CHART: contribution_chart(total, collaborators, contributors),
             }
-        body["Custom"] = empty_charts()
         return body
 
     # custom dates sent: only return Custom, each chart uses its own range
