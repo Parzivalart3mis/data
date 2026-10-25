@@ -18,6 +18,7 @@ from helpers import (
     get_beneficiary_location,
     get_beneficiary_location_candidates,
     load_city_coordinates,
+    reset_db_connection,
 )
 
 # Built once per container so the cities lookup and coordinate cache are reused
@@ -190,6 +191,8 @@ def lambda_handler(event, context):
 
     except Exception as e:
         print("saayam-org-aggregator error:", str(e))
+        # Leave the shared DB connection usable for the next request.
+        reset_db_connection()
 
         return {
             "statusCode": 500,

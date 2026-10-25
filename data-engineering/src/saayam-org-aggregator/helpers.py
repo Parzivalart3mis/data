@@ -100,11 +100,82 @@ def _empty_ai_frame():
 
 
 def _rollback():
-    """Clear an aborted transaction so later queries on the shared connection work."""
+    """Clear an aborted transaction so later queries on the shared connection work.
+
+    psycopg2 runs every query inside a transaction. After ONE failed query that
+    transaction is "aborted" and Postgres rejects every later query on the same
+    connection. The connection is cached at module level, so without a rollback a
+    single failure would break every following request in this warm container.
+    """
     try:
         _db_conn.rollback()
     except Exception:  # noqa: BLE001
         pass
+
+
+def reset_db_connection():
+    """Public wrapper so the handler can clear the connection after any failure."""
+    _rollback()
+
+
+def _query_all(sql, params):
+    """Optional lookup: rows as a list of dicts, or None if the query failed.
+
+    Used only for EXTRA data (names for geocoding). A failure is logged, rolled
+    back and reported as None, so the caller can carry on without that data.
+    """
+    try:
+        cursor = _db_conn.cursor()
+        cursor.execute(sql, params)
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    except Exception as e:  # noqa: BLE001 - optional lookup, never fatal
+        logger.warning("optional lookup failed: %s", e)
+        _rollback()
+        return None
+
+
+def get_state_country_names(state_ids):
+    """{state_id: {"state_name", "country_name"}} for address building.
+
+    Two separate queries, so losing read access to one table only loses that
+    table's names. Missing names are simply left out of the address; the city
+    and state code are still enough for the cities-table geocoder.
+    """
+    state_ids = sorted({str(s) for s in state_ids if not is_blank(s)})
+    if not state_ids:
+        return {}
+
+    states = _query_all(
+        f"""
+        SELECT state_id, state_name, country_id
+        FROM {_db_name}.states
+        WHERE state_id = ANY(%s)
+        """,
+        (state_ids,),
+    ) or []
+    names = {
+        str(r["state_id"]): {"state_name": r.get("state_name"), "country_name": None,
+                             "country_id": r.get("country_id")}
+        for r in states
+    }
+
+    country_ids = sorted({v["country_id"] for v in names.values()
+                          if v["country_id"] is not None})
+    if country_ids:
+        countries = _query_all(
+            f"""
+            SELECT country_id, country_name
+            FROM {_db_name}.countries
+            WHERE country_id = ANY(%s)
+            """,
+            (country_ids,),
+        ) or []
+        by_id = {r["country_id"]: r.get("country_name") for r in countries}
+        for value in names.values():
+            value["country_name"] = by_id.get(value["country_id"])
+
+    return names
 
 
 def _query_one(sql, params):
@@ -133,7 +204,7 @@ def get_beneficiary_location_candidates(request_id, beneficiary_id):
 
     1. requests.req_loc coordinates
     2. user_locations.curr_loc for the beneficiary
-    3. beneficiary profile address (users + cities/states/countries), geocoded
+    3. beneficiary profile address (users; state/country names optional), geocoded
     4. requests.req_loc as free text (e.g. 'Suffolk, VA'), geocoded
 
     Uses the beneficiary only - never the volunteer/admin viewing the request,
@@ -170,18 +241,18 @@ def get_beneficiary_location_candidates(request_id, beneficiary_id):
 
     profile = _query_one(
         f"""
-        SELECT u.addr_ln1, u.addr_ln2, u.addr_ln3, u.city_name, u.zip_code,
-               u.state_id, s.state_name, c.country_name
-        FROM {_db_name}.users AS u
-        LEFT JOIN {_db_name}.states AS s
-            ON s.state_id = u.state_id
-        LEFT JOIN {_db_name}.countries AS c
-            ON c.country_id = u.country_id
-        WHERE u.user_id = %s
+        SELECT addr_ln1, addr_ln2, addr_ln3, city_name, zip_code, state_id
+        FROM {_db_name}.users
+        WHERE user_id = %s
         """,
         (beneficiary_id,),
     )
     if profile:
+        names = get_state_country_names([profile.get("state_id")]).get(
+            str(profile.get("state_id")), {}
+        )
+        profile["state_name"] = names.get("state_name")
+        profile["country_name"] = names.get("country_name")
         address = _join_parts(
             [
                 profile.get("addr_ln1"),
@@ -209,23 +280,35 @@ def get_beneficiary_location_candidates(request_id, beneficiary_id):
 
 
 def load_city_coordinates():
-    """Rows from cities (+ state code/name) for the city_table geocoder."""
+    """Rows from cities for the city_table geocoder.
+
+    state_code / state_name only add extra ways to match ("US-CA", "California");
+    they come from a separate optional lookup so an unreadable states table
+    doesn't take the city coordinates down with it.
+    """
     try:
         df = pd.read_sql(
             f"""
-            SELECT ci.city_name, ci.state_id, ci.lattitude, ci.longitude,
-                   s.state_code, s.state_name
-            FROM {_db_name}.cities AS ci
-            LEFT JOIN {_db_name}.states AS s
-                ON s.state_id = ci.state_id
+            SELECT city_name, state_id, lattitude, longitude
+            FROM {_db_name}.cities
             """,
             _db_conn,
         )
-        return df.to_dict(orient="records")
     except Exception as e:  # noqa: BLE001
         logger.warning("could not load cities for geocoding: %s", e)
         _rollback()
         return []
+
+    rows = df.to_dict(orient="records")
+    states = _query_all(
+        f"SELECT state_id, state_code, state_name FROM {_db_name}.states", ()
+    ) or []
+    by_state = {str(r["state_id"]): r for r in states}
+    for row in rows:
+        extra = by_state.get(str(row.get("state_id")), {})
+        row["state_code"] = extra.get("state_code")
+        row["state_name"] = extra.get("state_name")
+    return rows
 
 
 def get_beneficiary_location(beneficiary_id):
@@ -313,6 +396,7 @@ def get_req_info(request_id, beneficiary_id):
         }
 
     except psycopg2.DatabaseError as e:
+        _rollback()
         raise Exception(
             f"Database error while fetching request {request_id}: {e}"
         ) from e
@@ -398,7 +482,8 @@ def get_representatives_for_orgs(df):
             user_ids = user_id_df["user_id"].dropna().tolist()
             reps_per_org.append(get_user_info(user_ids))
 
-        except psycopg2.DatabaseError as e:
+        except Exception as e:  # noqa: BLE001 - one org's reps must not fail the list
+            _rollback()
             logger.warning(
                 "Failed to fetch reps for org %s: %s",
                 org_id,
@@ -431,18 +516,12 @@ def get_orgs_from_db(location, category):
 
             df = pd.read_sql(
                 f"""
-                SELECT DISTINCT o.*,
-                       s.state_name AS geo_state_name,
-                       c.country_name AS geo_country_name
+                SELECT DISTINCT o.*
                 FROM {_db_name}.organizations AS o
                 INNER JOIN {_db_name}.org_skills AS os
                     ON o.org_id = os.org_id
                 INNER JOIN {_db_name}.help_categories AS hc
                     ON os.cat_id = hc.cat_id
-                LEFT JOIN {_db_name}.states AS s
-                    ON s.state_id = o.state_id
-                LEFT JOIN {_db_name}.countries AS c
-                    ON c.country_id = s.country_id
                 WHERE hc.cat_name = %s
                   AND o.city_name = %s
                 """,
@@ -452,18 +531,12 @@ def get_orgs_from_db(location, category):
         else:
             df = pd.read_sql(
                 f"""
-                SELECT DISTINCT o.*,
-                       s.state_name AS geo_state_name,
-                       c.country_name AS geo_country_name
+                SELECT DISTINCT o.*
                 FROM {_db_name}.organizations AS o
                 INNER JOIN {_db_name}.org_skills AS os
                     ON o.org_id = os.org_id
                 INNER JOIN {_db_name}.help_categories AS hc
                     ON os.cat_id = hc.cat_id
-                LEFT JOIN {_db_name}.states AS s
-                    ON s.state_id = o.state_id
-                LEFT JOIN {_db_name}.countries AS c
-                    ON c.country_id = s.country_id
                 WHERE hc.cat_name = %s
                 """,
                 _db_conn,
@@ -479,15 +552,24 @@ def get_orgs_from_db(location, category):
             axis=1,
         )
 
-        add_db_geo_columns(df)
+        df = get_representatives_for_orgs(df)
 
-        return get_representatives_for_orgs(df)
-
-    except psycopg2.DatabaseError as e:
+    except Exception as e:  # noqa: BLE001
+        _rollback()
         raise Exception(
             f"Database error while fetching orgs "
             f"for {location}/{category}: {e}"
         ) from e
+
+    # Distance-only enrichment runs AFTER the essential query has succeeded,
+    # and can never fail the organizations list.
+    try:
+        add_db_geo_columns(df)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not build organization addresses: %s", e)
+        for column in GEO_COLUMNS:
+            df[column] = None
+    return df
 
 
 def add_db_geo_columns(df):
@@ -497,18 +579,21 @@ def add_db_geo_columns(df):
             df[column] = None
         return df
 
-    df[GEO_ADDRESS] = df.apply(
-        lambda r: _join_parts(
+    names = get_state_country_names(df.get("state_id", pd.Series(dtype=object)).tolist())
+
+    def _address(r):
+        state_names = names.get(str(r.get("state_id")), {})
+        return _join_parts(
             [
                 r.get("street"),
                 r.get("city_name"),
-                _readable(r.get("geo_state_name")) or r.get("state_id"),
+                _readable(state_names.get("state_name")) or r.get("state_id"),
                 r.get("zip_code"),
-                _readable(r.get("geo_country_name")),
+                _readable(state_names.get("country_name")),
             ]
-        ),
-        axis=1,
-    )
+        )
+
+    df[GEO_ADDRESS] = df.apply(_address, axis=1)
     df[GEO_CITY] = df.get("city_name")
     df[GEO_STATE] = df.get("state_id")
     return df
