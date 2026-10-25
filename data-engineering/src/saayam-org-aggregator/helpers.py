@@ -282,6 +282,10 @@ def get_beneficiary_location_candidates(request_id, beneficiary_id):
 def load_city_coordinates():
     """Rows from cities for the city_table geocoder.
 
+    Raises if cities cannot be read: the geocoder must be able to tell a failed
+    read (temporary, retried later) from a genuinely empty table. Returning []
+    on failure would be cached as "no cities" until the next cold start.
+
     state_code / state_name only add extra ways to match ("US-CA", "California");
     they come from a separate optional lookup so an unreadable states table
     doesn't take the city coordinates down with it.
@@ -294,10 +298,9 @@ def load_city_coordinates():
             """,
             _db_conn,
         )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("could not load cities for geocoding: %s", e)
+    except Exception:
         _rollback()
-        return []
+        raise
 
     rows = df.to_dict(orient="records")
     states = _query_all(

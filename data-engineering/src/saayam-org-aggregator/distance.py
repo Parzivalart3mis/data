@@ -66,6 +66,16 @@ MISSING_LOCATION_TOKENS = {"", "n/a", "na", "none", "null", "unknown", "nan", "-
 
 DEFAULT_GEOCODE_BUDGET = 25          # external geocode calls per invocation
 DEFAULT_GEOCODE_TIME_BUDGET_S = 5.0  # wall-clock seconds spent geocoding
+DEFAULT_CITY_TABLE_RETRY_MAX_S = 60.0  # longest wait between retries of a failing cities load
+DEFAULT_CITY_TABLE_REFRESH_S = 6 * 3600.0  # reload a good cities table this often
+
+
+class LookupUnavailable(Exception):
+    """The data a geocoder needs could not be read right now (e.g. a DB error).
+
+    This is a temporary failure, not an answer: callers report it as "error",
+    and it is never cached, so the next request tries again.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -217,6 +227,9 @@ class Geocoder:
     name = "base"
     external = False   # True if each call costs an external API request
 
+    def begin_request(self) -> None:
+        """Hook called once at the start of each Lambda invocation."""
+
     def geocode(self, address: Optional[str], city: Optional[str] = None,
                 state: Optional[str] = None) -> GeocodeResult:
         raise NotImplementedError
@@ -235,27 +248,85 @@ class CityTableGeocoder(Geocoder):
     """Resolve 'city, state' against the internal cities table (no external calls).
 
     `rows_loader` returns dicts with city_name, lattitude/latitude, longitude and
-    any of state_id / state_code / state_name. It is called lazily, once.
+    any of state_id / state_code / state_name. It must RAISE if the table cannot
+    be read; returning [] means "the table is genuinely empty".
     Precision is the city centre, which is adequate for a straight-line estimate.
+
+    Caching rules (issue #433 review, step 2):
+      * A successful load is kept and refreshed every `refresh_s`.
+      * A failed load is NOT kept. geocode() returns "error" (never cached by
+        CoordinateCache) and the load is retried later:
+          - at most once per request (begin_request), never once per organization;
+          - the request after a first failure retries straight away, so one
+            brief DB hiccup is fixed by the next call;
+          - if it keeps failing, the wait grows 5 s, 10 s, 20 s ... up to
+            `retry_max_s`, so a real outage costs at most one query per minute.
+      * If a refresh fails, the previous good data keeps being used.
     """
 
     name = "city_table"
 
-    def __init__(self, rows_loader: Callable[[], Iterable[Dict[str, Any]]]):
+    def __init__(self, rows_loader: Callable[[], Iterable[Dict[str, Any]]],
+                 retry_max_s: Optional[float] = None, refresh_s: Optional[float] = None):
         self._rows_loader = rows_loader
         self._by_city_state: Optional[Dict[Tuple[str, str], GeoPoint]] = None
         self._by_city: Dict[str, Optional[GeoPoint]] = {}
+        self.retry_max_s = float(os.environ.get("CITY_TABLE_RETRY_MAX_S",
+                                                DEFAULT_CITY_TABLE_RETRY_MAX_S)
+                                 if retry_max_s is None else retry_max_s)
+        self.refresh_s = float(os.environ.get("CITY_TABLE_REFRESH_S",
+                                              DEFAULT_CITY_TABLE_REFRESH_S)
+                               if refresh_s is None else refresh_s)
+        self._loaded_at = 0.0
+        self._failures = 0              # consecutive failed loads
+        self._next_attempt = 0.0        # monotonic time before which we don't retry
+        self._attempted_this_request = False
+
+    def begin_request(self) -> None:
+        """Called once per Lambda invocation: allow one load attempt in it."""
+        self._attempted_this_request = False
+
+    def _retry_delay(self) -> float:
+        if self._failures <= 1:
+            return 0.0                  # first failure: the next request may retry
+        return min(self.retry_max_s, 5.0 * 2 ** (self._failures - 2))
 
     @staticmethod
     def _key(value: Any) -> str:
         return re.sub(r"[\s_]+", " ", str(value)).strip().lower()
 
     def _load(self) -> None:
-        if self._by_city_state is not None:
+        """Make sure lookup data is available, or raise LookupUnavailable."""
+        now = time.monotonic()
+        fresh = (self._by_city_state is not None
+                 and now - self._loaded_at < self.refresh_s)
+        if fresh:
             return
+        if self._attempted_this_request or now < self._next_attempt:
+            if self._by_city_state is not None:
+                return                       # refresh failed recently: keep old data
+            raise LookupUnavailable("cities table unavailable (waiting to retry)")
+        self._attempted_this_request = True
+        try:
+            rows = list(self._rows_loader())
+        except Exception as exc:  # noqa: BLE001
+            self._failures += 1
+            self._next_attempt = now + self._retry_delay()
+            logger.warning("cities load failed (%d in a row, next retry in %.0f s): %s",
+                           self._failures, self._retry_delay(), exc)
+            if self._by_city_state is not None:
+                logger.warning("cities refresh failed, keeping previous data: %s", exc)
+                return
+            raise LookupUnavailable(f"cities table unavailable: {exc}") from exc
+        self._index(rows)
+        self._loaded_at = now
+        self._failures = 0
+        self._next_attempt = 0.0
+
+    def _index(self, rows: Iterable[Dict[str, Any]]) -> None:
         by_city_state: Dict[Tuple[str, str], GeoPoint] = {}
         by_city: Dict[str, Optional[GeoPoint]] = {}
-        for row in self._rows_loader():
+        for row in rows:
             lat = row.get("lattitude", row.get("latitude"))
             point = _make_point(lat, row.get("longitude"), "cities")
             city = row.get("city_name")
@@ -292,7 +363,11 @@ class CityTableGeocoder(Geocoder):
         return self._by_city.get(city_key)
 
     def geocode(self, address, city=None, state=None):
-        self._load()
+        try:
+            self._load()
+        except LookupUnavailable:
+            # Already logged once in _load; don't repeat it for every organization.
+            return GeocodeResult(STATUS_ERROR)
         if not is_blank(city):
             point = self._lookup(city, state)
             if point:
@@ -310,6 +385,10 @@ class CityTableGeocoder(Geocoder):
 
 class ChainGeocoder(Geocoder):
     """Try providers in order; first 'ok' wins."""
+
+    def begin_request(self) -> None:
+        for provider in self.providers:
+            provider.begin_request()
 
     def __init__(self, providers: Sequence[Geocoder]):
         self.providers = list(providers)
@@ -445,6 +524,7 @@ class GeocodeSession:
                   if time_budget_s is None else time_budget_s)
         self.deadline = time.monotonic() + float(budget)
         self.external_calls = 0
+        geocoder.begin_request()
 
     def geocode_address(self, address: Optional[str], city: Optional[str] = None,
                         state: Optional[str] = None) -> GeocodeResult:
