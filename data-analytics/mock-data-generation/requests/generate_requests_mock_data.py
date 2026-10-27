@@ -3,7 +3,6 @@
 import argparse
 import csv
 from datetime import datetime, timedelta
-import hashlib
 import json
 from pathlib import Path
 import random
@@ -328,7 +327,7 @@ def build_dataset(seed=42, row_count=500):
         1,
         [0],
         "beneficiary_id;lead_volunteer_id",
-        "Both nullable references are null; full-column rates are recorded in manifest.json.",
+        "Both nullable references are null; the README documents the full-column null rates.",
     )
     mark(
         2,
@@ -477,7 +476,6 @@ def generate(output_dir, seed=42, row_count=500):
     write_csv(output_dir / "pii_manifest.csv", list(pii[0]), pii)
     manifest = {
         "schema_source": "https://github.com/user-attachments/files/33914221/saayam_schema.sql",
-        "schema_sha256": hashlib.sha256(SCHEMA_PATH.read_bytes()).hexdigest(),
         "seed": seed,
         "request_count": row_count,
         "null_marker": NULL,
@@ -489,11 +487,6 @@ def generate(output_dir, seed=42, row_count=500):
         "synthetic_pii_rows": [row["req_id"] for row in pii],
         "boundary_timestamp": timestamp(STAMP),
     }
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
     return manifest
 
 

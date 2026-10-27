@@ -47,7 +47,6 @@ Additional generated files are not application tables:
 
 - `special_cases.csv` maps numbered issue cases to exact request IDs, columns and descriptions. IDs refer to CSV records, not physical lines, since a description contains a newline.
 - `pii_manifest.csv` identifies every request with planted synthetic personal details, its affected fields and PII types. Names, example-domain email addresses, fictional street addresses and reserved 555-01xx phone numbers are invented test inputs. They are retained intentionally to test downstream redaction. No live personal data is used.
-- `manifest.json` records the seed, schema hash, table sizes, null counts and shared timestamp.
 - `fixtures/requests_broken_reference.csv` is deliberately invalid and is excluded from the main loader.
 
 The historical CSV exports in `data-analytics/sql` are replaced by this coherent request dataset. The separate organization/volunteer generator and its data under `data-analytics/mock-data-generation/` are unchanged.
@@ -72,23 +71,9 @@ For default settings, request IDs are `REQ-MOCK-0001` through `REQ-MOCK-0500`, e
 
 Record 12 also deliberately exceeds the usual trigger-generated identifier format while staying within the declared SQL types. The supplied schema has no ID-format check constraint. The empty key and the maximum-length identifiers ensure the test data exercises what the schema actually permits.
 
-## Validate
+## Options and reproducibility
 
-Run the standard-library test suite:
-
-```sh
-python -B -m unittest discover -s data-analytics/mock-data-generation/requests -p test_requests_mock_data.py -v
-```
-
-It checks PK/FK integrity in all nine tables, all eleven cases, scalar lengths, CSV round-tripping, complete PII labels, small supported row counts and byte-identical output across separate processes with different Python hash seeds. Changing the generator seed changes the non-fixed request data. All dates are anchored constants, never the current time.
-
-After starting the local database, run the independent PostgreSQL checks:
-
-```sh
-docker compose -f data-analytics/mock-data-generation/requests/compose.yaml exec -T postgres psql -U mock_user -d saayam_mock -f /schema/verify_local_postgres.sql
-```
-
-The checks read the loaded tables, confirm all eleven cases including PostGIS values and null/empty distinctions, then stage the invalid fixture in a temporary table and require a creator-FK violation on insertion. Validation rolls back and leaves the 500 main requests unchanged. Any failed check makes `psql` exit unsuccessfully.
+The generator validates keys, references, types and string lengths before writing. Running it twice with the same seed and row count produces byte-identical CSVs. Changing the seed changes the non-fixed request data. All dates are anchored constants, never the current time. The command prints table sizes and nullable-reference counts for inspection.
 
 To generate elsewhere or change the size:
 
@@ -96,4 +81,4 @@ To generate elsewhere or change the size:
 python data-analytics/mock-data-generation/requests/generate_requests_mock_data.py --seed 17 --rows 1000 --output-dir /path/to/fixtures
 ```
 
-At least 50 requests are required. `--output-dir` controls generation only; Compose still mounts `data-analytics/sql`, so use its default output for the two-command setup, or explicitly override the `/fixtures` bind mount. For non-default row counts, pass `-v expected_requests=1000` to the PostgreSQL check command. The generator overwrites only its own named output files; it never silently deletes unrelated files.
+At least 50 requests are required. `--output-dir` controls generation only; Compose still mounts `data-analytics/sql`, so use its default output for the two-command setup, or explicitly override the `/fixtures` bind mount. The generator overwrites only its own named output files; it never silently deletes unrelated files.

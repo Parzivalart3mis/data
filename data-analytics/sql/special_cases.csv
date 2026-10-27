@@ -1,5 +1,5 @@
 case_number,file,req_id,columns,description
-1,requests.csv,REQ-MOCK-0001,beneficiary_id;lead_volunteer_id,Both nullable references are null; full-column rates are recorded in manifest.json.
+1,requests.csv,REQ-MOCK-0001,beneficiary_id;lead_volunteer_id,Both nullable references are null; the README documents the full-column null rates.
 2,requests.csv,REQ-MOCK-0001,last_updated_at,Rows 1-3 and 6 share 2026-10-24 12:00:00.123456; rows 4 and 5 differ by one microsecond.
 2,requests.csv,REQ-MOCK-0002,last_updated_at,Rows 1-3 and 6 share 2026-10-24 12:00:00.123456; rows 4 and 5 differ by one microsecond.
 2,requests.csv,REQ-MOCK-0003,last_updated_at,Rows 1-3 and 6 share 2026-10-24 12:00:00.123456; rows 4 and 5 differ by one microsecond.
