@@ -25,6 +25,24 @@ external provider can be plugged in later without touching the Lambda:
 Geocoding results are cached by normalized address in a module-level cache that
 survives warm Lambda invocations, and a per-invocation call budget turns
 anything beyond the budget into "deferred" instead of slowing the response.
+
+Response fields added to every organization
+-------------------------------------------
+distance         number (miles, 1 decimal) or null. Unknown is ALWAYS null, never 0.
+distance_unit    "miles"
+distance_method  "straight_line"  both ends are exact points (request coordinates,
+                                  saved location, or a street-level geocoder)
+                 "city_centroid"  at least one end is the centre of its city from the
+                                  cities table, so the distance is approximate
+distance_status  decided in this order; the first that applies wins:
+  online            the organization is online-only (no physical location)
+  unknown_location  the organization has no address, OR the beneficiary has no
+                    location anywhere (no req_loc, no saved location, no address)
+  error             a lookup failed (DB error, geocoding provider error/exception)
+  deferred          not attempted: geocoding time or call budget used up
+  not_found         an address exists but could not be matched to coordinates
+                    (the beneficiary's address, or the organization's)
+  ok                distance calculated
 """
 import json
 import logging
@@ -40,7 +58,8 @@ logger = logging.getLogger(__name__)
 
 EARTH_RADIUS_MILES = 3958.7613
 DISTANCE_UNIT = "miles"
-DISTANCE_METHOD = "straight_line"
+DISTANCE_METHOD = "straight_line"            # both points exact
+DISTANCE_METHOD_APPROX = "city_centroid"     # at least one point is a city centre
 DISTANCE_DECIMALS = 1
 
 STATUS_OK = "ok"
@@ -85,7 +104,8 @@ class LookupUnavailable(Exception):
 class GeoPoint:
     lat: float
     lon: float
-    source: str = ""   # where the point came from, for logging only
+    source: str = ""            # where the point came from, for logging only
+    approximate: bool = False   # True for a city centre rather than an exact spot
 
 
 @dataclass(frozen=True)
@@ -103,8 +123,11 @@ def _is_valid(lat: Any, lon: Any) -> bool:
             and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0)
 
 
-def _make_point(lat: Any, lon: Any, source: str) -> Optional[GeoPoint]:
-    return GeoPoint(float(lat), float(lon), source) if _is_valid(lat, lon) else None
+def _make_point(lat: Any, lon: Any, source: str,
+                approximate: bool = False) -> Optional[GeoPoint]:
+    if not _is_valid(lat, lon):
+        return None
+    return GeoPoint(float(lat), float(lon), source, approximate)
 
 
 def is_blank(value: Any) -> bool:
@@ -344,7 +367,7 @@ class CityTableGeocoder(Geocoder):
         by_city: Dict[str, Optional[GeoPoint]] = {}
         for row in rows:
             lat = row.get("lattitude", row.get("latitude"))
-            point = _make_point(lat, row.get("longitude"), "cities")
+            point = _make_point(lat, row.get("longitude"), "cities", approximate=True)
             city = row.get("city_name")
             if point is None or is_blank(city):
                 continue
@@ -466,7 +489,8 @@ class CoordinateCache:
     refresh interval (CITY_TABLE_REFRESH_S, 6 h by default), so a wrong
     "not found" can't outlive the data it came from.
     A persistent backend (DB table, DynamoDB...) can be attached later via
-    `backend` with get(key) -> (lat, lon) | None and set(key, lat, lon).
+    `backend` with get(key) -> (lat, lon[, approximate]) | None and
+    set(key, lat, lon, approximate).
     """
 
     def __init__(self, ttl_s: float = 7 * 24 * 3600, miss_ttl_s: Optional[float] = None,
@@ -498,7 +522,9 @@ class CoordinateCache:
                 logger.warning("coordinate cache backend get failed: %s", exc)
                 stored = None
             if stored:
-                result = GeocodeResult(STATUS_OK, GeoPoint(stored[0], stored[1], "cache"))
+                approx = bool(stored[2]) if len(stored) > 2 else False
+                result = GeocodeResult(STATUS_OK,
+                                       GeoPoint(stored[0], stored[1], "cache", approx))
                 self._put(key, result, self.ttl_s)
                 self.hits += 1
                 return result
@@ -510,7 +536,8 @@ class CoordinateCache:
             self._put(key, result, self.ttl_s)
             if self.backend is not None:
                 try:
-                    self.backend.set(key, result.point.lat, result.point.lon)
+                    self.backend.set(key, result.point.lat, result.point.lon,
+                                     result.point.approximate)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("coordinate cache backend set failed: %s", exc)
         elif result.status == STATUS_NOT_FOUND:
@@ -588,6 +615,7 @@ class LocationCandidate:
     address: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None
+    lookup_failed: bool = False   # the DB query for this step failed (-> "error")
 
 
 def resolve_beneficiary_point(candidates: Sequence[LocationCandidate],
@@ -595,10 +623,18 @@ def resolve_beneficiary_point(candidates: Sequence[LocationCandidate],
     """First usable point from the ordered candidates.
 
     Returns (point, status). Never falls back to a default such as 'United States'.
+    When no point is found, the status says why, most serious first:
+      error            a lookup failed (DB error, geocoder error)
+      deferred         geocoding was skipped for lack of time/budget
+      not_found        an address existed but could not be matched
+      unknown_location there really is no location for this beneficiary
     """
-    saw_failure = None
+    seen = set()
     for candidate in candidates:
         try:
+            if candidate.lookup_failed:
+                seen.add(STATUS_ERROR)
+                continue
             if candidate.coordinates is not None:
                 point = parse_coordinates(candidate.coordinates, candidate.source)
                 if point:
@@ -607,23 +643,27 @@ def resolve_beneficiary_point(candidates: Sequence[LocationCandidate],
                 result = session.geocode_address(candidate.address, candidate.city,
                                                   candidate.state)
                 if result.status == STATUS_OK:
-                    return GeoPoint(result.point.lat, result.point.lon, candidate.source), STATUS_OK
-                if result.status in (STATUS_ERROR, STATUS_DEFERRED):
-                    saw_failure = saw_failure or result.status
+                    return GeoPoint(result.point.lat, result.point.lon, candidate.source,
+                                    result.point.approximate), STATUS_OK
+                seen.add(result.status)
         except Exception as exc:  # noqa: BLE001
             logger.warning("beneficiary location step %s failed: %s", candidate.source, exc)
-            saw_failure = STATUS_ERROR
-    return None, (saw_failure or STATUS_UNKNOWN_LOCATION)
+            seen.add(STATUS_ERROR)
+    for status in (STATUS_ERROR, STATUS_DEFERRED, STATUS_NOT_FOUND):
+        if status in seen:
+            return None, status
+    return None, STATUS_UNKNOWN_LOCATION
 
 
 # --------------------------------------------------------------------------- #
 # Organizations
 # --------------------------------------------------------------------------- #
-def _distance_fields(distance: Optional[float], status: str) -> Dict[str, Any]:
+def _distance_fields(distance: Optional[float], status: str,
+                     method: str = DISTANCE_METHOD) -> Dict[str, Any]:
     return {
         "distance": distance,
         "distance_unit": DISTANCE_UNIT,
-        "distance_method": DISTANCE_METHOD,
+        "distance_method": method,
         "distance_status": status,
     }
 
@@ -646,13 +686,15 @@ def organization_distance(record: Dict[str, Any], beneficiary: Optional[GeoPoint
             address = record.get("location")
         city, state = record.get(GEO_CITY), record.get(GEO_STATE)
 
+        # Order matters - see "distance_status" in the module docstring.
         if not is_blank(address) and ONLINE_PATTERN.match(str(address)):
             return _distance_fields(None, STATUS_ONLINE)
+        # An org without an address has no location, whatever happened elsewhere.
+        if is_blank(address) and is_blank(city):
+            return _distance_fields(None, STATUS_UNKNOWN_LOCATION)
         if beneficiary is None:
             status = beneficiary_status if beneficiary_status != STATUS_OK else STATUS_UNKNOWN_LOCATION
             return _distance_fields(None, status)
-        if is_blank(address) and is_blank(city):
-            return _distance_fields(None, STATUS_UNKNOWN_LOCATION)
 
         result = session.geocode_address(address, city, state)
         if result.status != STATUS_OK or result.point is None:
@@ -660,7 +702,9 @@ def organization_distance(record: Dict[str, Any], beneficiary: Optional[GeoPoint
                                     else STATUS_ERROR)
 
         miles = round(haversine_miles(beneficiary, result.point), DISTANCE_DECIMALS)
-        return _distance_fields(miles, STATUS_OK)
+        approximate = beneficiary.approximate or result.point.approximate
+        return _distance_fields(miles, STATUS_OK,
+                                DISTANCE_METHOD_APPROX if approximate else DISTANCE_METHOD)
     except Exception as exc:  # noqa: BLE001
         logger.warning("distance calculation failed for %r: %s", record.get("name"), exc)
         return _distance_fields(None, STATUS_ERROR)

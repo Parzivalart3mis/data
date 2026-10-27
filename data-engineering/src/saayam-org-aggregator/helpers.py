@@ -184,19 +184,23 @@ def get_state_country_names(state_ids):
 
 
 def _query_one(sql, params):
-    """Run a query and return the first row as a dict, or None. Never raises."""
+    """Run a query; return (first row as a dict or None, failed). Never raises.
+
+    `failed` lets callers tell "no such row" (a real answer) from "the query
+    broke" (report as error, not as a missing location).
+    """
     try:
         cursor = _db_conn.cursor()
         cursor.execute(sql, params)
         row = cursor.fetchone()
         if row is None:
-            return None
+            return None, False
         columns = [desc[0] for desc in cursor.description]
-        return dict(zip(columns, row))
+        return dict(zip(columns, row)), False
     except Exception as e:  # noqa: BLE001 - distance lookups must not break the API
         logger.warning("distance lookup query failed: %s", e)
         _rollback()
-        return None
+        return None, True
 
 
 def _readable(value):
@@ -217,7 +221,7 @@ def get_beneficiary_location_candidates(request_id, beneficiary_id):
     """
     candidates = []
 
-    request_row = _query_one(
+    request_row, failed = _query_one(
         f"""
         SELECT CAST(req_loc AS TEXT) AS req_loc
         FROM {_db_name}.requests
@@ -226,9 +230,10 @@ def get_beneficiary_location_candidates(request_id, beneficiary_id):
         (request_id,),
     )
     req_loc = request_row.get("req_loc") if request_row else None
-    candidates.append(LocationCandidate("requests.req_loc", coordinates=req_loc))
+    candidates.append(LocationCandidate("requests.req_loc", coordinates=req_loc,
+                                        lookup_failed=failed))
 
-    location_row = _query_one(
+    location_row, failed = _query_one(
         f"""
         SELECT CAST(curr_loc AS TEXT) AS curr_loc
         FROM {_db_name}.user_locations
@@ -236,7 +241,9 @@ def get_beneficiary_location_candidates(request_id, beneficiary_id):
         """,
         (beneficiary_id,),
     )
-    if location_row:
+    if failed:
+        candidates.append(LocationCandidate("user_locations.curr_loc", lookup_failed=True))
+    elif location_row:
         candidates.append(
             LocationCandidate(
                 "user_locations.curr_loc",
@@ -244,7 +251,7 @@ def get_beneficiary_location_candidates(request_id, beneficiary_id):
             )
         )
 
-    profile = _query_one(
+    profile, failed = _query_one(
         f"""
         SELECT addr_ln1, addr_ln2, addr_ln3, city_name, zip_code, state_id
         FROM {_db_name}.users
@@ -252,7 +259,9 @@ def get_beneficiary_location_candidates(request_id, beneficiary_id):
         """,
         (beneficiary_id,),
     )
-    if profile:
+    if failed:
+        candidates.append(LocationCandidate("users.profile_address", lookup_failed=True))
+    elif profile:
         names = get_state_country_names([profile.get("state_id")]).get(
             str(profile.get("state_id")), {}
         )
