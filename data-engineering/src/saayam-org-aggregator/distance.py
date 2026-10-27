@@ -262,6 +262,12 @@ class CityTableGeocoder(Geocoder):
           - if it keeps failing, the wait grows 5 s, 10 s, 20 s ... up to
             `retry_max_s`, so a real outage costs at most one query per minute.
       * If a refresh fails, the previous good data keeps being used.
+      * A refresh that returns 0 rows when we already had good data is treated
+        as a failure too (e.g. the table is mid-reload: rows deleted, not yet
+        re-inserted). We keep the old data, log a warning and retry later.
+      * The refresh and retry timers use wall-clock time.time(): Lambda freezes
+        the container between requests and time.monotonic() isn't guaranteed to
+        keep counting while frozen, so "6 hours" could silently become longer.
     """
 
     name = "city_table"
@@ -279,7 +285,7 @@ class CityTableGeocoder(Geocoder):
                                if refresh_s is None else refresh_s)
         self._loaded_at = 0.0
         self._failures = 0              # consecutive failed loads
-        self._next_attempt = 0.0        # monotonic time before which we don't retry
+        self._next_attempt = 0.0        # time.time() before which we don't retry
         self._attempted_this_request = False
 
     def begin_request(self) -> None:
@@ -289,7 +295,9 @@ class CityTableGeocoder(Geocoder):
     def _retry_delay(self) -> float:
         if self._failures <= 1:
             return 0.0                  # first failure: the next request may retry
-        return min(self.retry_max_s, 5.0 * 2 ** (self._failures - 2))
+        # Cap the exponent: 5 * 2**6 = 320 s is already above retry_max_s, and an
+        # uncapped 2**n overflows float after ~1,025 failures in a row.
+        return min(self.retry_max_s, 5.0 * 2 ** min(self._failures - 2, 6))
 
     @staticmethod
     def _key(value: Any) -> str:
@@ -297,7 +305,7 @@ class CityTableGeocoder(Geocoder):
 
     def _load(self) -> None:
         """Make sure lookup data is available, or raise LookupUnavailable."""
-        now = time.monotonic()
+        now = time.time()   # wall clock: these timers span Lambda freezes (see class doc)
         fresh = (self._by_city_state is not None
                  and now - self._loaded_at < self.refresh_s)
         if fresh:
@@ -318,6 +326,14 @@ class CityTableGeocoder(Geocoder):
                 logger.warning("cities refresh failed, keeping previous data: %s", exc)
                 return
             raise LookupUnavailable(f"cities table unavailable: {exc}") from exc
+        if not rows and self._by_city_state is not None:
+            # An empty refresh after a good load isn't a real answer (the table is
+            # probably being reloaded). Treat it like a failure: keep the old data.
+            self._failures += 1
+            self._next_attempt = now + self._retry_delay()
+            logger.warning("cities refresh returned 0 rows (%d in a row); keeping previous "
+                           "data, next retry in %.0f s", self._failures, self._retry_delay())
+            return
         self._index(rows)
         self._loaded_at = now
         self._failures = 0
@@ -445,14 +461,19 @@ def build_geocoder(context: Dict[str, Any], provider_names: Optional[str] = None
 class CoordinateCache:
     """Address -> GeocodeResult cache. Module-level, so it survives warm starts.
 
-    ok and not_found results are cached (not_found for a shorter TTL);
-    deferred and error are never cached so they are retried next time.
+    ok and not_found results are cached; deferred and error are never cached
+    so they are retried next time. not_found is kept no longer than the cities
+    refresh interval (CITY_TABLE_REFRESH_S, 6 h by default), so a wrong
+    "not found" can't outlive the data it came from.
     A persistent backend (DB table, DynamoDB...) can be attached later via
     `backend` with get(key) -> (lat, lon) | None and set(key, lat, lon).
     """
 
-    def __init__(self, ttl_s: float = 7 * 24 * 3600, miss_ttl_s: float = 24 * 3600,
+    def __init__(self, ttl_s: float = 7 * 24 * 3600, miss_ttl_s: Optional[float] = None,
                  max_entries: int = 5000, backend: Any = None):
+        if miss_ttl_s is None:
+            miss_ttl_s = float(os.environ.get("CITY_TABLE_REFRESH_S",
+                                              DEFAULT_CITY_TABLE_REFRESH_S))
         self.ttl_s, self.miss_ttl_s, self.max_entries = ttl_s, miss_ttl_s, max_entries
         self.backend = backend
         self._store: Dict[str, Tuple[float, GeocodeResult]] = {}

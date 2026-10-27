@@ -79,6 +79,11 @@ _db_conn = psycopg2.connect(
     port=_creds["PORT"],
     sslmode="require",
 )
+# This Lambda only reads. With autocommit each query finishes on its own, so the
+# connection never sits "idle in transaction" holding locks between requests
+# (which blocks ALTER TABLE etc.), and a failed query can't leave the connection
+# "aborted". The _rollback() calls below stay as an extra safety net.
+_db_conn.autocommit = True
 # -------------------------------------------------------------
 
 
