@@ -110,12 +110,7 @@ jobs:
         env:
           SECRET_KEY: test-secret
         run: |
-          pytest -v tests/ \\
-            --cov=src \\
-            --cov-report=term-missing \\
-            --cov-report=xml:coverage.xml \\
-            --cov-report=html:htmlcov \\
-            --cov-fail-under=80
+          pytest -v tests/ --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov --cov-fail-under=80
 
       - name: Upload code coverage reports
         if: always()
